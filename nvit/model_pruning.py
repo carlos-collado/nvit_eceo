@@ -52,6 +52,12 @@ def connect_output_to_input(parent_parameter, child_parameter, dim=0, shift=0,bi
     # child_parameter  - parameter to be zeroed depending on the loss from parent
     # dim - dimension to be affected, 0 - output channel, 1 - input channel
     # bias - set to zero bias as well
+    
+    
+    # CCC addition -- compatibility v0
+    if not hasattr(child_parameter, 'weight'):
+        return
+
     parent_parameter.set_to_zero.append({"parameter_name": extra_name  + ".weight:"+ child_parameter.__repr__(),
                                          "dim": dim, "parameter": child_parameter.weight, "shift": shift, "allow_trim": allow_trim})
     if hasattr(child_parameter, 'bias') and dim==0:

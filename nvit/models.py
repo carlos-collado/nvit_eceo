@@ -243,7 +243,13 @@ class QKV(nn.Module):
 
 class DistilledVisionTransformer(VisionTransformer):
     def __init__(self, *args, **kwargs):
+        
+        # CCC addition -- compatibility v0
+        for key in ["pretrained_cfg", "pretrained_cfg_overlay", "cache_dir"]:
+            kwargs.pop(key, None)  # Pops the key if it exists, does nothing otherwise
+
         super().__init__(*args, **kwargs)
+        
         self.dist_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
         img_size = self.patch_embed.img_size
         patch_size = self.patch_embed.patch_size
@@ -253,6 +259,13 @@ class DistilledVisionTransformer(VisionTransformer):
         num_patches = self.patch_embed.num_patches
         
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 2, self.embed_dim))
+        
+        # CCC addition -- compatibility v0
+        kernel_size = kwargs.get('kernel_size', None)
+        if kernel_size is None:
+            print('WARNING CCC addition -- compatibility v0: kernel_size not defined. Set to 0')
+            kernel_size = 0
+
         self.pos = (kernel_size==0)
         self.head_dist = nn.Linear(self.embed_dim, self.num_classes) if self.num_classes > 0 else nn.Identity()
 

@@ -4,7 +4,6 @@ from typing import Iterable, Optional
 
 import torch
 import torch.nn as nn
-from apex import amp
 from pruning_core.pruning_utils import lr_cosine_policy
 
 from timm.data import Mixup

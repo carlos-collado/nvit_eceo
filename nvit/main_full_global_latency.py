@@ -40,8 +40,10 @@ except ImportError:
 has_native_amp = False
 try:
     if getattr(torch.cuda.amp, 'autocast') is not None:
+        print("Native Torch AMP is available.")
         has_native_amp = True
 except AttributeError:
+    print("Native Torch AMP is not available.")
     pass
 
 def str2bool(v):
@@ -347,12 +349,21 @@ class Knowledge_Distillation_Loss(torch.nn.Module):
 
 
 def main(args):
+    print(args)
+
+    # -----------------------------------------------------------------
+    # 1. INITIALIZATION
+    # -----------------------------------------------------------------
+    if args.distillation_type != 'none' and args.finetune and not args.eval:
+        raise NotImplementedError("Finetuning with distillation not yet supported")
+
+    # 1.1. DDP Setup
     utils.init_distributed_mode(args)
 
-    print(args)
-    
+    # 1.2. Parse Pruning Config (Simple, defaults to: '{"Global":39000}')
     prune_dict = json.loads(args.prune_dict)
     
+    # 1.3. Output Directory Folder Name
     args.output_dir = args.output_dir+'/global_prune_'+args.data_set+'_'+args.model+'_lr'+str(args.lr)
     if args.pruning:
         for key in prune_dict:
@@ -361,31 +372,36 @@ def main(args):
             args.output_dir = args.output_dir+'_lat_'+str(args.latency_regularization)+'_target_'+str(args.latency_target)
         args.output_dir = args.output_dir+'_ft_'+str(args.epochs)
 
+    # 1.4. Mapping Pruning Intervals
     interval_prune = {}
     idx = 0
     for key in prune_dict:
         interval_prune[key] = args.interval_prune[idx]
         idx += 1
 
+    # 1.5. Tensorboard loggind (not used)
     if utils.is_main_process():
         writer = SummaryWriter(args.output_dir)
 
-    if args.distillation_type != 'none' and args.finetune and not args.eval:
-        raise NotImplementedError("Finetuning with distillation not yet supported")
-
+    # 1.6. Device
     device = torch.device(args.device)
 
-    # fix the seed for reproducibility
+    # 1.7 Fix seed for reproducibility
     seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     # random.seed(seed)
-
     cudnn.benchmark = True
 
+    # -----------------------------------------------------------------
+    # 2. DATA LOADING
+    # -----------------------------------------------------------------
+    
+    # 2.1. Build Dataset
     dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
     dataset_val, _ = build_dataset(is_train=False, args=args)
 
+    # 2.2. Create Sampler (DDP)
     if True:  # args.distributed:
         num_tasks = utils.get_world_size()
         global_rank = utils.get_rank()
@@ -410,6 +426,7 @@ def main(args):
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
+    # 2.3. Create DataLoader
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
         batch_size=args.batch_size,
@@ -426,6 +443,7 @@ def main(args):
         drop_last=False
     )
 
+    # 2.4. Iterations based on DataLoader
     # Number of iterations per epoch.
     args.iters_per_epoch = len(data_loader_train)
 
@@ -433,6 +451,11 @@ def main(args):
     args.train_iters = args.epochs * args.iters_per_epoch
 
 
+    # -----------------------------------------------------------------
+    # 3. MODEL CREATION AND PREPARATION
+    # -----------------------------------------------------------------
+
+    # 3.1. Mixup (augmentation that blends two images and their labels)
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
     if mixup_active:
@@ -443,6 +466,7 @@ def main(args):
     else:
         print('nomix1')
 
+    # 3.2. Create Teacher/Student Models
     print(f"Creating model: {args.model}")
     teacher_model = create_model(
         args.model,
@@ -464,6 +488,7 @@ def main(args):
     teacher_model.to(device)
     student_model.to(device)
     
+    # 3.3. AMP (Automatic Mixed Precision)
     use_amp = None
     if args.amp:
         # for backwards compat, `--amp` arg tries apex before native amp
@@ -473,17 +498,23 @@ def main(args):
             args.native_amp = True
     if args.apex_amp and has_apex:
         use_amp = 'apex'
+        print("Using NVIDIA APEX AMP. Training in mixed precision.")
     elif args.native_amp and has_native_amp:
         use_amp = 'native'
+        print("Using native Torch AMP. Training in mixed precision.")
     elif args.apex_amp or args.native_amp:
         print("Neither APEX or native Torch AMP is available, using float32. "
                         "Install NVIDA apex or upgrade to PyTorch 1.6")
 
     linear_scaled_lr = args.lr * args.batch_size * utils.get_world_size() / 512.0
     args.lr = linear_scaled_lr
+    
+    # 3.4. Optimizer (AdamW with parameters in args)
     optimizer_teacher = create_optimizer(args, teacher_model)
     optimizer = create_optimizer(args, student_model)
-    
+
+    # 3.5. AMP (Automatic Mixed Precision) - Part 2
+
     loss_scaler = None
     if use_amp == 'apex':
         teacher_model, optimizer_teacher = amp.initialize(teacher_model, optimizer_teacher, opt_level='O1')
@@ -502,6 +533,7 @@ def main(args):
     
     del optimizer_teacher
 
+    # 3.6. Model EMAs (Exponential Moving Averages)
     teacher_model_ema = None
     student_model_ema = None
     if args.model_ema:
@@ -517,6 +549,7 @@ def main(args):
             device='cpu' if args.model_ema_force_cpu else '',
             resume='')
 
+    # 3.7. Models to DDP
     teacher_model_without_ddp = teacher_model
     student_model_without_ddp = student_model
     if args.distributed:
@@ -539,8 +572,10 @@ def main(args):
     #utils.print_model_parameters(student_model)
     #exit()
 
+    # 3.8. LR Scheduler
     lr_scheduler, _ = create_scheduler(args, optimizer)
 
+    # 3.9. Loss Function (Criterion)
     criterion = LabelSmoothingCrossEntropy()
 
     if args.mixup > 0.:
@@ -552,6 +587,7 @@ def main(args):
         criterion = torch.nn.CrossEntropyLoss()
         print('nomix2')
 
+    # 3.10. DeiT Distillation Setup (CNN Teacher Model)
     CNN_teacher_model = None
     if args.distillation_type != 'none':
         assert args.teacher_path, 'need to specify teacher-path when using distillation'
@@ -579,6 +615,9 @@ def main(args):
 
     orig_criterion = criterion
 
+    # -----------------------------------------------------------------
+    # 4. RESUME FROM CHECKPOINT
+    # -----------------------------------------------------------------
     output_dir = Path(args.output_dir)
     if args.resume:
         if args.resume.startswith('https'):
@@ -598,6 +637,11 @@ def main(args):
             if 'scaler' in checkpoint:
                 loss_scaler.load_state_dict(checkpoint['scaler'])
 
+
+
+    # -----------------------------------------------------------------
+    # 5. EVALUATION (IF NEEDED)
+    # -----------------------------------------------------------------
     if args.eval:
         test_stats = evaluate(data_loader_val, student_model, device)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
@@ -605,7 +649,13 @@ def main(args):
 
     teacher_model.eval()
     
-    print(f"..............INITIALIZE PRUNING..............")
+    # -----------------------------------------------------------------
+    # 6. PRUNING INITIALIZATION
+    # -----------------------------------------------------------------
+    import pdb; pdb.set_trace()
+
+    if utils.is_main_process():
+        print(f"..............INITIALIZE PRUNING..............")
     create_pruning_structure_vit(student_model, prune_token=False, prune_emb=True, prune_MLP=True, prune_head=True, prune_qk=True, prune_v=True, only_skip = args.only_skip)
 
     distillation_loss = Knowledge_Distillation_Loss().cuda()
@@ -625,7 +675,14 @@ def main(args):
     pruning_engine.init_pruning_helper(student_model, None, skip_pass=True)
 
     max_accuracy = 0.0
-    ############ pruning with Taylor expansion
+
+
+
+    # -----------------------------------------------------------------
+    # 7. PRUNING EXECUTION
+    # -----------------------------------------------------------------
+
+    # 7.1. Initial Setup for Taylor Expansion-based Pruning
     if args.pruning:
         args.train_main = False
         if args.prune_train:
@@ -653,12 +710,17 @@ def main(args):
         start_iter = 0
         
         first = True
+        
+        # 7.2. Initialize Pruning Loop
         for key in prune_dict:
             frequency = interval_prune[key]
+            
+            # 7.3. Enable Initial Pruning Settings
             if first:
                 enable_pruning(pruning_engine, prune_emb=True, prune_MLP=True, prune_head=True, prune_qk=True, prune_v=True)
                 first = False
-                
+            
+            # 7.4. Execute Taylor Expansion Pruning Iteration
             epoch,start_iter,end = prune_with_Taylor(args, start_epoch, start_iter, data_loader_train, student_model, teacher_model, pruning_engine,
                             optimizer_gates_lr, frequency, gate_loss_coeff,
                             main_loss_coeff, prune_dict[key], optimizer, lr_scheduler, loss_scaler, args.batch_size,
@@ -666,6 +728,8 @@ def main(args):
                             prune_per_iteration=prune_per_iteration,
                             original_loss_coeff = original_loss_coeff, mixup_fn=mixup_fn)
             total_epoch += epoch
+            
+            # 7.5. Save Checkpoints After Each Pruning Iteration
             if args.output_dir:
                 checkpoint_paths = [args.output_dir+'/checkpoint.pth',args.output_dir+'/pruned_checkpoint.pth']
                 for checkpoint_path in checkpoint_paths:
@@ -679,6 +743,7 @@ def main(args):
                         'args': args,
                     }, checkpoint_path)
             
+            # 7.6. Early Exit Check
             if end:
                 break
         exit()
@@ -687,6 +752,9 @@ def main(args):
             return 0
 
         pruning_engine.pruning_iterations_done = pruning_engine.maximum_pruning_iterations
+        
+        if utils.is_main_process():
+            print(f"Pruning done, with pruning_engine: \n {pruning_engine}")
 
 
 if __name__ == '__main__':
@@ -695,3 +763,4 @@ if __name__ == '__main__':
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
+    print('Script finished')
